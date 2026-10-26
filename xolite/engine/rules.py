@@ -354,27 +354,36 @@ def _thread(spec: TurnSpec) -> TurnResult:
             calls.append(ToolCall("spawn", {"title": f"Check {steps[0][:40].lower()}"},
                                   why="the first step is worth its own pass"))
 
-    calls.extend(_work_forward(steps, done, thread))
+    calls.extend(_work_forward(steps, done, thread, spec))
     return TurnResult(calls=calls)
 
 
-def _work_forward(steps: list[str], done: int, thread: dict) -> list[ToolCall]:
+def _work_forward(steps: list[str], done: int, thread: dict,
+                  spec: TurnSpec | None = None) -> list[ToolCall]:
     """Take steps until one needs the owner, or the checklist runs out.
 
     Stopping after a single step would leave the thread idle in the middle of its
     own list, which reads as stuck rather than busy.
+
+    A risky step the owner has already allowed by rule is taken without asking —
+    that is the whole point of having said so once — but it is still named in the
+    note, so "it did it because you said it could" stays visible.
     """
     calls: list[ToolCall] = []
     did: list[str] = []
+    byrule: list[str] = []
     cursor = done
     while cursor < len(steps):
         step = steps[cursor]
         level, reasons, command = risk_of(step)
+        if level and spec is not None and spec.allows(step):
+            byrule.append(step)
+            level = None
         if level:
             calls.append(ToolCall("update_status", {"status_md": checklist_md(steps, done=cursor, doing=cursor)},
                                   why=f"stopping at step {cursor + 1} of {len(steps)}"))
             if did:
-                calls.append(ToolCall("note", {"text": _done_note(did, step)}, why="say what moved"))
+                calls.append(ToolCall("note", {"text": _done_note(did, step, byrule)}, why="say what moved"))
             calls.append(_ask(level, reasons, command, step, thread))
             return calls
         did.append(step)
@@ -383,14 +392,18 @@ def _work_forward(steps: list[str], done: int, thread: dict) -> list[ToolCall]:
     calls.append(ToolCall("update_status", {"status_md": checklist_md(steps, done=len(steps))},
                           why="every step is done"))
     if did:
-        calls.append(ToolCall("note", {"text": _done_note(did, None)}, why="say what moved"))
+        calls.append(ToolCall("note", {"text": _done_note(did, None, byrule)}, why="say what moved"))
     calls.append(ToolCall("finish", {"summary": f"All {len(steps)} steps done."},
                           why="nothing is left on the checklist"))
     return calls
 
 
-def _done_note(did: list[str], next_step: str | None) -> str:
+def _done_note(did: list[str], next_step: str | None,
+               byrule: list[str] | None = None) -> str:
     body = "Done:\n" + "\n".join(f"- {s}" for s in did) if len(did) > 1 else f"Done: **{did[0]}**."
+    if byrule:
+        which = ", ".join(f"**{s}**" for s in byrule)
+        body += f"\n\nI did not stop at {which} — you have a rule for that."
     return body + (f"\n\nNext I need you: **{next_step}**" if next_step else "")
 
 
@@ -410,7 +423,8 @@ def _ask(level: str, reasons: list[str], command: str | None, step: str, thread:
         "detail": {"command": command, "text": f"From the brief of “{thread.get('title', 'this thread')}”."},
         "options": [
             {"id": "o_allow", "decision": "allow", "label": "Allow once"},
-            {"id": "o_thread", "decision": "allow", "scope": "thread", "label": "Allow this in this thread"},
+            {"id": "o_thread", "decision": "allow", "scope": "thread",
+             "label": "Allow this in this thread", "sentence": step},
             {"id": "o_deny", "decision": "deny", "label": "Not now", "note": True},
         ],
     }, why=f"the step {reasons[0]}")

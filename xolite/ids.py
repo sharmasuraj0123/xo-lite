@@ -64,6 +64,10 @@ def review_id() -> str:
     return f"rv_{token(16)}"
 
 
+def rule_id() -> str:
+    return f"rul_{token(12)}"
+
+
 def hop_id() -> str:
     return f"hop_{token(12)}"
 

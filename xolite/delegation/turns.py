@@ -85,6 +85,10 @@ def _spec(session: dict, message: dict | None) -> TurnSpec:
         message=message,
         thread=thread,
         projects=_facts_for(chat_id),
+        rules=[r for r in store.rules(include_revoked=False)
+               if r.get("scope") == "space"
+               or (r.get("scope") == "thread" and r.get("thread_ts") == thread_ts)
+               or (r.get("scope") == "project" and r.get("chat_id") == chat_id)],
         history=history,
         turn_index=_turns.get(session["id"], 0),
     )

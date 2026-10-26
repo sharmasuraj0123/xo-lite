@@ -6,17 +6,21 @@ It speaks the storm surface (`/api/chat/*`) that [xo-coworker](../xo-coworker)
 talks to, does real work on real files, gives every thread its own git worktree —
 and decides what happens to a message with rules rather than an LLM.
 
+Both halves are here: the server, and `xo-ui/` — the front end, cut down to
+what the server can actually answer.
+
 ```sh
 pip install -r requirements.txt
-python run.py                     # http://127.0.0.1:5002
+python run.py                     # the backend, :5002
 ```
-
-Then point the UI at it. Its default `XO_API` is already `http://127.0.0.1:5002`,
-so there is nothing to configure:
 
 ```sh
-cd ../xo-coworker && python serve.py     # :5180
+cd xo-ui && python serve.py       # the UI,      :5180
 ```
+
+Open <http://localhost:5180>. There is nothing to configure: the UI's default
+`XO_API` is already `http://127.0.0.1:5002`. Every project is a direct child
+folder of `~/xo-projects`, so drop one in and restart to see it.
 
 ## Why there is no model
 
@@ -85,6 +89,8 @@ refused and logged — the engine cannot widen its own powers.
 | `xolite/api/chat.py` | `/api/chat/*` — the storm surface |
 | `xolite/api/files.py` | `/api/files/*` — the filesystem, confined to the projects root |
 | `xolite/api/projects.py` | project file and image reads, `/api/config/workspace` |
+| `tests/test_rules.py` | what the engine decides, and what a rule may not widen |
+| `xo-ui/` | the front end, and what was cut from it — see its own README |
 
 ## Filesystem
 
@@ -98,6 +104,22 @@ checked against the projects root before it is touched; one that escapes is
 on the UI's proxy to block the dangerous routes. This server blocks them itself,
 so it is safe to run without that proxy in front of it.
 
+## Rules
+
+A decision can be answered once, or answered for good. "Allow for this thread"
+and "Make it a rule" store the decision's own sentence, word for word, and the
+engine consults it the next time that exact step comes round.
+
+The restraint is the feature. A rule for *"Drop the old index"* is not a rule for
+*"Drop the users table"*: matching is exact after whitespace and case, and
+nothing generalises, because a permission system that widens on its own stops
+being one. Revoking is immediate, and a thread carried past an ask by a rule says
+so in its own note rather than going quiet.
+
+Rules are the only thing that may skip an ask. They are made in one place — the
+owner answering a decision — and nowhere else; `POST /api/chat/rules` exists for
+symmetry, not as a second door.
+
 ## Storage
 
 Everything is machine-local under `~/.xo-lite`, the same convention xo-space
@@ -105,7 +127,7 @@ follows. Nothing is written into a project except its git worktrees.
 
 ```
 ~/.xo-lite/
-  state.json          the index: chats, threads, sessions, review, hops, runs
+  state.json          the index: chats, threads, sessions, review, rules, hops, runs
   messages/<chat>.jsonl   append-only, one file per chat
   frames.jsonl        every stream frame, for a Last-Event-ID resume
   attachments/        files on messages
@@ -134,6 +156,17 @@ name fails at boot rather than on the first message.
 
 The rules engine is the worked example, and its pure parts are worth reusing
 whatever decides: `is_work`, `steps_of`, `risk_of`, `title_of`, `pick_project`.
+
+## Tests
+
+Stdlib only — nothing to install beyond the server's own dependencies.
+
+```sh
+python -m unittest discover -s tests
+```
+
+They cover the two things worth pinning down: what the engine decides from a
+message, and what a standing rule may not quietly widen into.
 
 ## What it is not
 

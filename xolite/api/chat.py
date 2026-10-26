@@ -204,7 +204,37 @@ async def get_hops(chat: str, thread: str | None = None,
 
 @router.get("/chats/{chat}/memory")
 async def get_memory(chat: str):
-    return {"files": []}
+    """Markdown a project keeps for its coordinator: every *.md at its root."""
+    project = store.project_of(chat)
+    root = store.project_dir(project)
+    if not root.is_dir():
+        return {"files": []}
+    files = []
+    for path in sorted(root.glob("*.md")):
+        try:
+            files.append({"path": path.name, "bytes": path.stat().st_size})
+        except OSError:
+            continue
+    return {"files": files}
+
+
+@router.get("/chats/{chat}/memory/{path:path}")
+async def get_memory_file(chat: str, path: str):
+    """One of those files. Confined to the project root, like every other read."""
+    project = store.project_of(chat)
+    root = store.project_dir(project).resolve()
+    try:
+        target = (root / path).resolve()
+        target.relative_to(root)
+    except (ValueError, OSError):
+        raise fail(400, "outside_project", "That path is outside the project.")
+    if not target.is_file():
+        raise fail(404, "not_found", "No such file.")
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as err:
+        raise fail(409, "unreadable", str(err))
+    return {"path": path, "content": text, "bytes": len(text.encode("utf-8"))}
 
 
 # ── attachments ──────────────────────────────────────────────────────────────
@@ -292,6 +322,89 @@ async def get_transcript(rid: str, after: str | None = None, limit: int = 200):
     return {"items": items, "next_after": None}
 
 
+class SessionPatch(BaseModel):
+    agent: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    permission_mode: str | None = None
+
+
+@router.patch("/sessions/{sid}")
+async def patch_session(sid: str, body: SessionPatch):
+    """The pin on a session. Only the four fields the client offers are writable."""
+    row = store.session(sid)
+    if not row:
+        raise fail(404, "session_not_found", "No such session.")
+    fields = body.model_dump(exclude_none=True)
+    if fields:
+        pin = dict(row.get("pin") or {})
+        pin.update(fields)
+        row = store.update_session(sid, pin=pin)
+        store.save()
+        stream.session(row, "patched")
+    return row
+
+
+def _stop_runs(rows: list[dict], why: str) -> int:
+    """Mark running runs stopped and announce each one. Returns how many moved."""
+    stopped = 0
+    for run in rows:
+        if run.get("state") not in ("running", "queued"):
+            continue
+        row = store.update_run(run["id"], state="finished", status="stopped",
+                               ended_at=ids.now_iso(), summary=why)
+        stream.run_finished(row)
+        stopped += 1
+    return stopped
+
+
+@router.post("/runs/{rid}/stop")
+async def stop_run(rid: str):
+    row = store.run(rid)
+    if not row:
+        raise fail(404, "run_not_found", "No such run.")
+    stopped = _stop_runs([row], "You stopped it.")
+    store.save()
+    return {"stopped": stopped}
+
+
+@router.post("/sessions/{sid}/runs/stop")
+async def stop_session_runs(sid: str):
+    if not store.session(sid):
+        raise fail(404, "session_not_found", "No such session.")
+    stopped = _stop_runs(store.runs_of(sid).get("runs", []), "You stopped it.")
+    row = store.update_session(sid, state="idle")
+    if row:
+        stream.session(row, "stopped")
+    store.save()
+    return {"stopped": stopped}
+
+
+@router.post("/abort")
+async def abort(body: dict = Body(default={})):
+    """Stop a session where it stands.
+
+    A thread caught mid-checklist is left `paused`, never `done`, so its card
+    still reads as work someone has to pick back up.
+    """
+    sid = str(body.get("session_id") or "")
+    session = store.session(sid)
+    if not session:
+        raise fail(404, "session_not_found", "No such session.")
+    _stop_runs(store.runs_of(sid).get("runs", []), "You stopped it.")
+    row = store.update_session(sid, state="idle")
+    if row:
+        stream.session(row, "aborted")
+    ts = session.get("thread_ts")
+    thread = store.thread(ts) if ts else None
+    if thread and thread.get("state") == "working":
+        store.update_thread(ts, state="paused")
+        store.set_card(ts, happened="You stopped it.", needs_you="")
+        stream.thread(store.thread(ts))
+    store.save()
+    return {"aborted": True, "session_id": sid}
+
+
 @router.get("/active")
 async def active():
     return {"sessions": [s for s in store.sessions() if s["state"] == "running"]}
@@ -316,6 +429,20 @@ async def get_review_item(rid: str):
     return item
 
 
+def _option(item: dict, body: dict) -> dict | None:
+    """The option the client picked, by id, else one matching a scope it named."""
+    want = body.get("option") or body.get("option_id")
+    for opt in item.get("options") or []:
+        if want and opt.get("id") == want:
+            return opt
+    scope = body.get("scope")
+    if scope:
+        for opt in item.get("options") or []:
+            if opt.get("scope") == scope:
+                return opt
+    return None
+
+
 @router.post("/review/{rid}/decision")
 async def decide(rid: str, body: dict = Body(default={})):
     """The owner answers. This is what lets a stopped thread carry on."""
@@ -327,7 +454,21 @@ async def decide(rid: str, body: dict = Body(default={})):
 
     decision = str(body.get("decision") or "allow")
     note = body.get("note")
+
+    # "Allow for this thread" / "Make it a rule": the client names one of the
+    # item's own options, and the rule is that option's sentence, word for word.
+    # Nothing is inferred - an option carrying no scope makes no rule.
+    chosen = _option(item, body)
+    made = None
+    if decision in ("allow", "approve") and chosen and chosen.get("scope") in ("thread", "project", "rule"):
+        scope = "space" if chosen["scope"] == "rule" else chosen["scope"]
+        made = store.add_rule(sentence=chosen.get("sentence") or item["title"], scope=scope,
+                              chat_id=item.get("chat_id"), thread_ts=item.get("thread_ts"),
+                              tier=item.get("risk"), from_review=rid)
+
     closed = store.close_review(rid, decision, note)
+    if made:
+        closed["rule_id"] = made["id"]
     stream.review_decided(closed)
 
     ts = item.get("thread_ts")
@@ -359,7 +500,37 @@ async def decide(rid: str, body: dict = Body(default={})):
 # ── rules and worktrees ──────────────────────────────────────────────────────
 @router.get("/rules")
 async def get_rules(after_seq: int | None = None, limit: int = 500):
-    return {"rules": store.STATE.get("rules", []), "next_after_seq": None}
+    # No built-in defaults: every rule here was made by the owner answering a
+    # decision, so there is nothing the server could have decided in advance.
+    return {"rules": store.rules()[:limit], "defaults": [], "next_after_seq": None}
+
+
+class NewRule(BaseModel):
+    sentence: str
+    scope: str = "thread"
+    effect: str = "allow"
+    chat_id: str | None = None
+    thread_ts: str | None = None
+    tier: str | None = None
+
+
+@router.post("/rules")
+async def post_rule(body: NewRule):
+    if not body.sentence.strip():
+        raise fail(422, "empty_rule", "A rule needs the sentence it permits.")
+    row = store.add_rule(sentence=body.sentence, scope=body.scope, effect=body.effect,
+                         chat_id=body.chat_id, thread_ts=body.thread_ts, tier=body.tier)
+    store.save()
+    return row
+
+
+@router.delete("/rules/{rid}")
+async def delete_rule(rid: str):
+    row = store.revoke_rule(rid)
+    if not row:
+        raise fail(404, "rule_not_found", "That rule is already gone.")
+    store.save()
+    return {"revoked": True, "rule": row}
 
 
 @router.get("/worktrees")

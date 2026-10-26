@@ -68,6 +68,9 @@ class TurnSpec:
     projects: list[ProjectFacts] = field(default_factory=list)
     # This chat's recent messages, oldest first, for context.
     history: list[dict] = field(default_factory=list)
+    # Standing permissions that reach this turn, already filtered by scope. The
+    # engine matches them itself; it is handed rows, never the store.
+    rules: list[dict] = field(default_factory=list)
     turn_index: int = 0
 
     @property
@@ -77,6 +80,23 @@ class TurnSpec:
     @property
     def terminal_tools(self) -> set[str]:
         return TERMINAL.get(self.role, set())
+
+    def allows(self, sentence: str) -> dict | None:
+        """The standing rule covering this exact sentence, or None.
+
+        Word for word, after whitespace and case: a rule for "Drop the old
+        index" is not a rule for "Drop the users table". Widening this is how a
+        permission system quietly stops meaning anything.
+        """
+        want = " ".join(str(sentence or "").split()).casefold()
+        if not want:
+            return None
+        for row in self.rules:
+            if row.get("effect", "allow") != "allow" or row.get("revoked_at"):
+                continue
+            if " ".join(str(row.get("sentence") or "").split()).casefold() == want:
+                return row
+        return None
 
 
 @dataclass

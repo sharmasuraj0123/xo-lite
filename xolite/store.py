@@ -30,6 +30,7 @@ STATE: dict[str, Any] = {
     "review": {},    # rv id     → review item
     "hops": {},      # hop id    → hop row
     "runs": {},      # run id    → run row
+    "rules": {},     # rul id    → standing permission, made only from a decision
     "pools": {},
     "router": {"mode": "auto", "model": None, "provider": "xo-lite", "connected": True},
     "seq": 0,
@@ -372,6 +373,88 @@ def close_review(rid: str, decision: str, note: str | None = None) -> dict | Non
         item["note"] = note
         item["decided_at"] = ids.now_iso()
         return item
+
+
+# ── standing rules ───────────────────────────────────────────────────────────
+# A rule is only ever made by the owner answering a decision, word for word, and
+# it only ever covers that exact sentence. Nothing here widens on its own: a rule
+# for "Drop the old index" does not cover "Drop the users table".
+def _said(text: str) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def add_rule(*, sentence: str, scope: str = "thread", effect: str = "allow",
+             chat_id: str | None = None, thread_ts: str | None = None,
+             tier: str | None = None, from_review: str | None = None) -> dict:
+    with _lock:
+        row = {
+            "id": ids.rule_id(),
+            "sentence": str(sentence or "").strip(),
+            "effect": effect if effect in ("allow", "deny") else "allow",
+            "scope": scope if scope in ("thread", "project", "space") else "thread",
+            "chat_id": chat_id,
+            "thread_ts": thread_ts if scope == "thread" else None,
+            "project_pid": project_of(chat_id) if chat_id and scope == "project" else None,
+            "tier": tier,
+            "uses": 0,
+            "created_at": ids.now_iso(),
+            "revoked_at": None,
+            "from_review": from_review,
+        }
+        STATE["rules"][row["id"]] = row
+        return row
+
+
+def rules(include_revoked: bool = True) -> list[dict]:
+    rows = list(STATE["rules"].values())
+    if not include_revoked:
+        rows = [r for r in rows if not r.get("revoked_at")]
+    return sorted(rows, key=lambda r: r.get("created_at") or "")
+
+
+def rule(rid: str) -> dict | None:
+    return STATE["rules"].get(rid)
+
+
+def revoke_rule(rid: str) -> dict | None:
+    with _lock:
+        row = STATE["rules"].get(rid)
+        if not row or row.get("revoked_at"):
+            return None
+        row["revoked_at"] = ids.now_iso()
+        return row
+
+
+def rule_for(sentence: str, *, chat_id: str | None = None,
+             thread_ts: str | None = None) -> dict | None:
+    """The live rule that covers this exact sentence here, or None.
+
+    Narrowest wins, so a thread rule is consulted before a project one. The
+    engine asks this before it decides to stop; nothing else may skip an ask.
+    """
+    want = _said(sentence)
+    if not want:
+        return None
+    for scope in ("thread", "project", "space"):
+        for row in rules(include_revoked=False):
+            if row.get("scope") != scope or row.get("effect") != "allow":
+                continue
+            if _said(row.get("sentence")) != want:
+                continue
+            if scope == "thread" and row.get("thread_ts") != thread_ts:
+                continue
+            if scope == "project" and row.get("chat_id") != chat_id:
+                continue
+            return row
+    return None
+
+
+def use_rule(rid: str) -> dict | None:
+    with _lock:
+        row = STATE["rules"].get(rid)
+        if row:
+            row["uses"] = int(row.get("uses") or 0) + 1
+        return row
 
 
 # ── hops ─────────────────────────────────────────────────────────────────────
